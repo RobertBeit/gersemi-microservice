@@ -18,10 +18,18 @@ const searchSenatorTransactions = async (firstName, lastName, startDate, endDate
   try {
     console.log(`[Senator Service] Searching for ${firstName} ${lastName} from ${startDate} to ${endDate}`);
     
-    browser = await puppeteer.launch({
+    // Configure Puppeteer for production (Render) and local environments
+    const launchOptions = {
       headless: true,
       args: ["--no-sandbox", "--disable-setuid-sandbox"],
-    });
+    };
+
+    // On Render, use the system Chrome installation
+    if (process.env.NODE_ENV === "production") {
+      launchOptions.executablePath = "/usr/bin/chromium-browser";
+    }
+
+    browser = await puppeteer.launch(launchOptions);
 
     const page = await browser.newPage();
     page.setDefaultNavigationTimeout(60000);
