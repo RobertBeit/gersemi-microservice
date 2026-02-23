@@ -26,9 +26,20 @@ const searchSenatorTransactions = async (firstName, lastName, startDate, endDate
 
     // On Render, use the system Chrome installation
     if (process.env.NODE_ENV === "production") {
-      launchOptions.executablePath = "/usr/bin/chromium-browser";
+      const fs = require('fs');
+      if (fs.existsSync('/usr/bin/chromium')) {
+        launchOptions.executablePath = '/usr/bin/chromium';
+        console.log('[Senator Service] Using /usr/bin/chromium for Puppeteer');
+      } else if (fs.existsSync('/usr/bin/chromium-browser')) {
+        launchOptions.executablePath = '/usr/bin/chromium-browser';
+        console.log('[Senator Service] Using /usr/bin/chromium-browser for Puppeteer');
+      } else if (fs.existsSync('/usr/bin/google-chrome-stable')) {
+        launchOptions.executablePath = '/usr/bin/google-chrome-stable';
+        console.log('[Senator Service] Using /usr/bin/google-chrome-stable for Puppeteer');
+      } else {
+        console.log('[Senator Service] No system Chrome found, using Puppeteer default');
+      }
     }
-
     browser = await puppeteer.launch(launchOptions);
 
     const page = await browser.newPage();
