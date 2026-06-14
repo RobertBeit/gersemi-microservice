@@ -5,6 +5,18 @@ const path = require("path");
 const EFSEARCH_HOME_URL = "https://efdsearch.senate.gov/search/home/";
 const EFSEARCH_SEARCH_URL = "https://efdsearch.senate.gov/search/";
 
+const parseUsDateToEpoch = (value) => {
+  if (!value || typeof value !== "string") return 0;
+  const match = value.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (!match) return 0;
+
+  const month = Number(match[1]);
+  const day = Number(match[2]);
+  const year = Number(match[3]);
+  const epoch = new Date(year, month - 1, day).getTime();
+  return Number.isFinite(epoch) ? epoch : 0;
+};
+
 /**
  * Search for senator transactions on the Senate eFD site
  * @param {string} firstName - Senator's first name
@@ -285,34 +297,171 @@ const searchSenatorTransactions = async (firstName, lastName, startDate, endDate
     await page.screenshot({ path: resultsScreenshotPath });
     console.log(`[Senator Service] Results screenshot saved to ${resultsScreenshotPath}`);
 
-    // Extract report links from results
-    const reportLinks = await page.evaluate(() => {
-      const links = [];
-      const tables = document.querySelectorAll("table");
-      
-      if (tables.length > 0) {
-        const rows = tables[0].querySelectorAll("tbody tr");
-        rows.forEach((row) => {
-          const cells = row.querySelectorAll("td");
-          const reportLink = row.querySelector("a");
-          
-          if (reportLink && cells.length > 0) {
-            links.push({
-              firstName: cells[0]?.textContent.trim() || "",
-              lastName: cells[1]?.textContent.trim() || "",
-              filer: cells[2]?.textContent.trim() || "",
-              reportTitle: cells[3]?.textContent.trim() || "",
-              reportDate: cells[4]?.textContent.trim() || "",
-              reportUrl: reportLink.href,
-            });
-          }
-        });
+    // Match manual workflow: set DataTables page length to 100 before pagination.
+    await page.evaluate(() => {
+      if (typeof window.$ === "function" && window.$.fn && window.$.fn.dataTable) {
+        const table = window.$("#filedReports").DataTable();
+        table.page.len(100).draw("page");
       }
-      
+    });
+
+    try {
+      await page.waitForFunction(() => {
+        if (typeof window.$ === "function" && window.$.fn && window.$.fn.dataTable) {
+          const table = window.$("#filedReports").DataTable();
+          const info = table.page.info();
+          const processingNode = document.querySelector("#filedReports_processing");
+          const processingVisible = Boolean(
+            processingNode && processingNode.style && processingNode.style.display !== "none"
+          );
+          return info && info.length === 100 && !processingVisible;
+        }
+        return true;
+      }, { timeout: 15000 });
+    } catch (_error) {
+      console.warn("[Senator Service] Unable to confirm page length=100; continuing with current DataTables length");
+    }
+
+    // Extract report links from all paginated DataTables result pages.
+    const readCurrentPageReportLinks = async () => page.evaluate(() => {
+      const links = [];
+      const rows = document.querySelectorAll("#filedReports tbody tr");
+
+      rows.forEach((row) => {
+        const cells = row.querySelectorAll("td");
+        const reportLink = row.querySelector("a");
+
+        if (reportLink && cells.length > 0) {
+          links.push({
+            firstName: cells[0]?.textContent.trim() || "",
+            lastName: cells[1]?.textContent.trim() || "",
+            filer: cells[2]?.textContent.trim() || "",
+            reportTitle: cells[3]?.textContent.trim() || "",
+            reportDate: cells[4]?.textContent.trim() || "",
+            reportUrl: reportLink.href,
+          });
+        }
+      });
+
       return links;
     });
 
-    console.log(`[Senator Service] Found ${reportLinks.length} reports to process`);
+    const reportLinks = [];
+    const seenReportUrls = new Set();
+    let pageCounter = 0;
+
+    // Wait for DataTables to render first page after form submit.
+    try {
+      await page.waitForFunction(
+        () => document.querySelectorAll("#filedReports tbody tr").length > 0,
+        { timeout: 20000 }
+      );
+    } catch (_error) {
+      // If no rows, continue and let the normal flow return an empty result set.
+    }
+
+    while (true) {
+      pageCounter += 1;
+
+      const pageInfo = await page.evaluate(() => {
+        if (typeof window.$ === "function" && window.$.fn && window.$.fn.dataTable) {
+          const table = window.$("#filedReports").DataTable();
+          const info = table.page.info();
+          return {
+            page: info?.page ?? 0,
+            pages: info?.pages ?? 1,
+            recordsDisplay: info?.recordsDisplay ?? 0,
+          };
+        }
+
+        return {
+          page: 0,
+          pages: 1,
+          recordsDisplay: document.querySelectorAll("#filedReports tbody tr").length,
+        };
+      });
+
+      const pageLinks = await readCurrentPageReportLinks();
+      console.log(
+        `[Senator Service] Reading results page ${pageInfo.page + 1}/${pageInfo.pages}: ${pageLinks.length} row(s), ${pageInfo.recordsDisplay} total filtered row(s)`
+      );
+      const currentPageSignature = pageLinks.map((link) => link.reportUrl).join("|");
+
+      pageLinks.forEach((link) => {
+        if (!seenReportUrls.has(link.reportUrl)) {
+          seenReportUrls.add(link.reportUrl);
+          reportLinks.push(link);
+        }
+      });
+
+      const isLastPage = pageInfo.pages <= 1 || pageInfo.page >= pageInfo.pages - 1;
+      if (isLastPage) {
+        break;
+      }
+
+      const previousPageIndex = pageInfo.page;
+      const previousFirstUrl = pageLinks[0]?.reportUrl || null;
+
+      await page.evaluate(() => {
+        if (typeof window.$ === "function" && window.$.fn && window.$.fn.dataTable) {
+          window.$("#filedReports").DataTable().page("next").draw("page");
+          return;
+        }
+
+        const nextAnchor = document.querySelector("#filedReports_next a");
+        if (nextAnchor) {
+          nextAnchor.click();
+        }
+      });
+
+      try {
+        await page.waitForFunction(
+          (expectedNextIndex, previousSignature, previousFirstRowUrl) => {
+            if (typeof window.$ === "function" && window.$.fn && window.$.fn.dataTable) {
+              const info = window.$("#filedReports").DataTable().page.info();
+              const processingNode = document.querySelector("#filedReports_processing");
+              const processingVisible = Boolean(
+                processingNode && processingNode.style && processingNode.style.display !== "none"
+              );
+
+              const rowLinks = Array.from(document.querySelectorAll("#filedReports tbody tr a")).map((node) => node.href || "");
+              const signature = rowLinks.join("|");
+              const firstRowUrl = rowLinks[0] || null;
+
+              if (!info || info.page < expectedNextIndex) {
+                return false;
+              }
+
+              if (processingVisible) {
+                return false;
+              }
+
+              if (!signature) {
+                return true;
+              }
+
+              return signature !== previousSignature || firstRowUrl !== previousFirstRowUrl;
+            }
+            return true;
+          },
+          { timeout: 20000 },
+          previousPageIndex + 1,
+          currentPageSignature,
+          previousFirstUrl
+        );
+      } catch (_error) {
+        console.warn("[Senator Service] Timed out waiting for DataTables to advance to next page");
+        break;
+      }
+
+      // Safety guard in case pagination controls change unexpectedly.
+      if (pageCounter >= 200) {
+        console.warn("[Senator Service] Pagination safety limit reached at 200 pages");
+        break;
+      }
+    }
+
+    console.log(`[Senator Service] Found ${reportLinks.length} reports to process across ${pageCounter} page(s)`);
 
     // Visit each report and extract transactions
     const allTransactions = [];
@@ -408,9 +557,7 @@ const searchSenatorTransactions = async (firstName, lastName, startDate, endDate
 
     // Convert map to array and sort by report date descending
     const groupedReports = Array.from(reportMap.values()).sort((a, b) => {
-      const dateA = new Date(b.reportDate.replace(/(\d{2})\/(\d{2})\/(\d{4})/, '$3-$1-$2'));
-      const dateB = new Date(a.reportDate.replace(/(\d{2})\/(\d{2})\/(\d{4})/, '$3-$1-$2'));
-      return dateA - dateB;
+      return parseUsDateToEpoch(b.reportDate) - parseUsDateToEpoch(a.reportDate);
     });
 
     console.log(`[Senator Service] Grouped into ${groupedReports.length} reports`);
